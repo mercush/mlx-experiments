@@ -1,0 +1,25 @@
+[project]
+name = "speculate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dwave-networkx>=0.8.18",
+    "matplotlib>=3.10.7",
+    "mlx>=0.29.2",
+    "mlx-lm>=0.28.1",
+    "networkx>=3.4.2",
+    "numpy>=2.2.6",
+    "pytest>=8.4.2",
+    "tensorflow>=2.20.0",
+    "torch>=2.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "speculate",
+]
+
+[tool.uv.sources]
+speculate = { workspace = true }
