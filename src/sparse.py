@@ -1,14 +1,96 @@
 import mlx.core as mx
+import numpy as np
+import networkx as nx
+
+masked_matmul_source = """
+"""
+
+dense_vector_matmul_source = """
+"""
+
+masked_matmul_kernel = mx.fast.metal_kernel(
+    name="masked_matmul",
+    input_names=["inp"],
+    output_names=["out"],
+    source=masked_matmul_source
+)
+
+dense_vector_matmul_kernel = mx.fast.metal_kernel(
+    name="vector_matmul",
+    input_names=["inp"],
+    output_names=["out"],
+    source=masked_matmul_source
+)
+
+def _masked_matmul(
+    a_rows: mx.array,
+    a_cols: mx.array,
+    a_data: mx.array,
+    b_rows: mx.array,
+    b_cols: mx.array,
+    b_data: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """
+    Perform sparse matrix multiplication between two matrices in CSR format.
+    
+    Args:
+        a_rows: Row indices of the first matrix
+        a_cols: Column indices of the first matrix
+        a_data: Non-zero values of the first matrix
+        b_rows: Row indices of the second matrix
+        b_cols: Column indices of the second matrix
+        b_data: Non-zero values of the second matrix
+        
+    Returns:
+        A tuple of (rows, cols, data) arrays representing the result matrix
+    """
+    
+    outputs = masked_matmul_kernel( # pyright: ignore
+            inputs=[a_rows, a_cols, a_data, b_rows, b_cols, b_data],
+            grid=mx.array([1]),
+            threadgroup=mx.array([1]),
+            output_shapes=[(1,), (1,), (1,)],
+            output_dtypes=[mx.float32, mx.int32, mx.int32]
+    )
+    return outputs
+
+def _vector_matmul(
+    vec: mx.array,
+    mat_rows: mx.array,
+    mat_cols: mx.array,
+    mat_data: mx.array,
+) -> mx.array:
+    """
+    Perform sparse matrix-vector multiplication.
+    
+    Args:
+        vec: Dense vector to multiply with
+        mat_rows: Row indices of the sparse matrix
+        mat_cols: Column indices of the sparse matrix
+        mat_data: Non-zero values of the sparse matrix
+        
+    Returns:
+        Dense result vector
+    """
+    
+    outputs = dense_vector_matmul_kernel( # pyright: ignore
+            inputs=[vec, mat_rows, mat_cols, mat_data],
+            grid=mx.array([1]),
+            threadgroup=mx.array([1]),
+            output_shapes=[(vec.shape[0],)],
+            output_dtypes=[mx.float32]
+    )
+    return outputs[0]
 
 class Matrix:
     """
     A sparse matrix representation using MLX arrays.
     """
-    
-    def __init__(self, rows: mx.array, cols: mx.array, data: mx.array, shape: tuple):
+
+    def __init__(self, rows: mx.array, cols: mx.array, data: mx.array, shape: tuple, dtype: mx.Dtype = mx.float32):
         """
         Initialize a sparse matrix.
-        
+
         Args:
             data: The non-zero values of the matrix
             indices: The indices of the non-zero values
@@ -18,70 +100,45 @@ class Matrix:
         self.rows = rows
         self.cols = cols
         self.data = data
-        
+        self.dtype = dtype
+
     def to_dense(self) -> mx.array:
         """Convert sparse matrix to dense format."""
-        dense = mx.zeros(self.shape)
+        dense = mx.zeros(self.shape, dtype=self.dtype)
         dense[self.rows, self.cols] = self.data
         return dense
-        
-    @mx.compile
-    def __matmul__(self, other):
+
+    def masked_matmul(self, other, mask):
         """Matrix multiplication with another matrix or vector."""
-
-        result_rows = []
-        result_cols = []
-        result_data = []
-        
-        for i in range(len(self.rows)):
-            row_idx = self.rows[i]
-            col_idx = self.cols[i]
-            val = self.data[i]
-            
-            for j in range(len(other.rows)):
-                if other.rows[j] == col_idx:
-                    result_row = row_idx
-                    result_col = other.cols[j]
-                    result_val = val * other.data[j]
-                    
-                    found = False
-                    for k in range(len(result_rows)):
-                        if result_rows[k] == result_row and result_cols[k] == result_col:
-                            result_data[k] += result_val
-                            found = True
-                            break
-                    
-                    if not found:
-                        result_rows.append(result_row)
-                        result_cols.append(result_col)
-                        result_data.append(result_val)
-        
-        return Matrix(
-            mx.array(result_rows),
-            mx.array(result_cols),
-            mx.array(result_data),
-            (self.shape[0], other.shape[1])
+        res = _masked_matmul(
+            self.rows, self.cols, self.data, other.rows, other.cols, other.data
         )
+        return Matrix(res[0], res[1], res[2], mask.shape, self.dtype)
 
-def from_edgelist(edgelist) -> Matrix:
+    def vector_matmul(self, vector):
+        """Vector multiplication with a dense vector."""
+        res = _vector_matmul(vector, self.rows, self.cols, self.data)
+        return res
+
+
+def from_graph(graph, dtype=mx.float32) -> Matrix:
     """
     Create a sparse matrix from an edge list.
-    
+
     Args:
         edgelist: A list of tuples (row, col, value) representing non-zero entries
-        
+
     Returns:
         A sparse Matrix object
     """
-    if not edgelist:
-        return Matrix(mx.array([]), mx.array([]), mx.array([]), (0, 0))
+    np_graph = nx.to_numpy_array(graph)
+    shape = np_graph.shape
     
-    rows, cols, data = zip(*edgelist)
+    rows, cols = np.where(np_graph != 0)
+    data = np_graph[rows, cols]
     
-    # Determine matrix shape from max indices
-    max_row = max(rows) if rows else 0
-    max_col = max(cols) if cols else 0
-    shape = (max_row + 1, max_col + 1)
+    rows = mx.array(rows)
+    cols = mx.array(cols)
+    data = mx.array(data, dtype=dtype)
     
-    return Matrix(mx.array(rows), mx.array(cols), mx.array(data), shape)
-
+    return Matrix(rows, cols, data, shape, dtype)
