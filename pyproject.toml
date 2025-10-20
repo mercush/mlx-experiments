@@ -12,6 +12,7 @@ dependencies = [
     "networkx>=3.4.2",
     "numpy>=2.2.6",
     "pytest>=8.4.2",
+    "scikit-learn>=1.7.2",
     "tensorflow>=2.20.0",
     "torch>=2.8.0",
 ]
