@@ -4,15 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 # import fashion MNIST dataset from keras
-import tensorflow as tf
 from tensorflow import keras
 import matplotlib.pyplot as plt
 import time
 import numpy as np
 from sklearn.decomposition import PCA
-
-# Set random seed for reproducibility
-mx.random.seed(42)
 
 # Fashion MNIST class names
 CLASS_NAMES = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
@@ -56,7 +52,7 @@ class FashionMNISTNet(nn.Module):
     
     def encoder(self, x):
         x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
+        x = self.fc2(x)
         return x
 
     def decoder(self, x):
@@ -65,10 +61,8 @@ class FashionMNISTNet(nn.Module):
         return x
 
     def __call__(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.relu(self.fc3(x))
-        x = self.fc4(x)
+        x = self.encoder(x)
+        x = self.decoder(x)
         return x
 
 # Loss function
@@ -76,7 +70,7 @@ def loss_fn(model, X):
     return mx.mean((X - model(X)) ** 2)
 
 # Training function
-def train_model(model, train_data, test_data, batch_size, epochs=10, learning_rate=0.001):
+def train_model(model, train_data, batch_size, epochs=10, learning_rate=0.001):
     train_images, train_labels = train_data
 
     # Define optimizer and gradient function
@@ -132,7 +126,7 @@ if __name__ == "__main__":
     mx.eval(model.parameters())
 
     print("Starting training...")
-    train_model(model, train_data, test_data, batch_size, EPOCHS, LEARNING_RATE)
+    train_model(model, train_data, batch_size, EPOCHS, LEARNING_RATE)
 
     print("Training completed!")
 
