@@ -5,8 +5,7 @@ Instructions
 0. Install [uv](https://docs.astral.sh/uv/)
 1. `uv venv`
 2. `source .venv/bin/activate` 
-3. `uv sync`
-4. `time uv run train.py`
+3. `time uv run train.py`
 
 Questions:
 1. How does batch size affect runtime?
