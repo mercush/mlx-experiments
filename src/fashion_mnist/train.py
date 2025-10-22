@@ -82,23 +82,15 @@ def train_model(model, train_data, batch_size, epochs=10, learning_rate=0.001):
         total_loss = 0
         num_batches = 0
 
-        start_time = time.time()
-
         for X, _ in batch_iterate(batch_size, train_images, train_labels):
-            # Compute loss and gradients
             loss, grads = loss_and_grad_fn(model, X)
-
-            # Update the model with the gradients
             optimizer.update(model, grads)
-
-            # Compute the new parameters and optimizer state
             mx.eval(model.parameters(), optimizer.state)
 
             total_loss += loss.item()
             num_batches += 1
 
         avg_loss = total_loss / num_batches
-        epoch_time = time.time() - start_time
 
         print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - ")
 

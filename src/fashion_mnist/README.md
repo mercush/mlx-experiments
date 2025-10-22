@@ -7,6 +7,8 @@ Instructions
 2. `source .venv/bin/activate` 
 3. `time uv run train.py`
 
+Training should just take about a minute.
+
 Questions:
 1. How does batch size affect runtime?
 2. How does batch size training stability?

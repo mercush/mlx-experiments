@@ -1,6 +1,6 @@
 import mlx.core as mx
+from functools import partial
 from tqdm import tqdm
-import mlx.nn as nn
 import matplotlib.pyplot as plt
 
 BOUNDS = mx.array([-1, 1])
@@ -9,7 +9,7 @@ N = 1000
 K = 100000 # number of steps between pi_old updates
 M = 1 # number of pi_old updates
 
-
+@mx.compile
 def normal_logpdf(samples, mu, sigma):
     """Compute the log probability density of a normal distribution."""
     return (
@@ -18,6 +18,8 @@ def normal_logpdf(samples, mu, sigma):
         - 0.5 * mx.log(mx.array(2 * mx.pi))
     )
 
+state = [mx.random.state]
+@partial(mx.compile, inputs=state, outputs=state)
 def grad_step(params, params_old):
     def loss_fn(params):
         """Calculate the loss function for the PPO algorithm."""
@@ -33,10 +35,9 @@ def grad_step(params, params_old):
         loss = mx.mean(reward * log_ratio)
         return loss
 
-    lval, lgrad = mx.value_and_grad(loss_fn)(params)
+    _, lgrad = mx.value_and_grad(loss_fn)(params)
     params = params - LR * lgrad
     return params
-
 
 def test_ppo():
     params_old = mx.array([0.0, 1.0])
