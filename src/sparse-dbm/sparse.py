@@ -5,68 +5,309 @@ import networkx as nx
 masked_matmul_source = """
 // Sparse matrix-matrix multiplication with mask
 // This kernel computes C = mask * (A @ B) where A and B are in COO format
+// Heavily optimized with SIMD and float32 accumulation
 uint tid = thread_position_in_grid.x;
 if (tid >= mask_nnz) return;
 
 int i = mask_rows[tid];
 int j = mask_cols[tid];
 
-bfloat16_t sum = bfloat16_t(0);
+// Use float32 for accumulation to avoid precision loss
+float sum = 0.0f;
 
-// For each non-zero in A's row i
-for (int a_idx = 0; a_idx < a_nnz; a_idx++) {
-    if (a_rows[a_idx] == i) {
-        int k = a_cols[a_idx];
-        bfloat16_t a_val = a_data[a_idx];
+// For each non-zero in A's row i - process 4 at a time
+int a_idx = 0;
+for (; a_idx + 3 < a_nnz; a_idx += 4) {
+    // Load 4 row indices at once
+    simd_int4 a_rows_vec = simd_int4(a_rows[a_idx], a_rows[a_idx+1], a_rows[a_idx+2], a_rows[a_idx+3]);
+    simd_int4 i_vec = simd_int4(i);
+    simd_float4 row_match = simd_float4(a_rows_vec == i_vec);
 
-        // Find matching column in B (k-th row of B)
-        for (int b_idx = 0; b_idx < b_nnz; b_idx++) {
-            if (b_rows[b_idx] == k && b_cols[b_idx] == j) {
-                sum += a_val * b_data[b_idx];
+    for (int k = 0; k < 4; k++) {
+        if (row_match[k] != 0.0f) {
+            int a_k = a_cols[a_idx + k];
+            float a_val = float(a_data[a_idx + k]);
+
+            // Inner loop: find matching elements in B with SIMD
+            int b_idx = 0;
+            for (; b_idx + 3 < b_nnz; b_idx += 4) {
+                simd_int4 b_rows_vec = simd_int4(b_rows[b_idx], b_rows[b_idx+1], b_rows[b_idx+2], b_rows[b_idx+3]);
+                simd_int4 b_cols_vec = simd_int4(b_cols[b_idx], b_cols[b_idx+1], b_cols[b_idx+2], b_cols[b_idx+3]);
+                simd_int4 ak_vec = simd_int4(a_k);
+                simd_int4 j_vec = simd_int4(j);
+
+                simd_float4 match = simd_float4((b_rows_vec == ak_vec) & (b_cols_vec == j_vec));
+                simd_float4 b_vals = simd_float4(
+                    float(b_data[b_idx]),
+                    float(b_data[b_idx+1]),
+                    float(b_data[b_idx+2]),
+                    float(b_data[b_idx+3])
+                );
+                simd_float4 prod = match * b_vals;
+                sum += a_val * (prod[0] + prod[1] + prod[2] + prod[3]);
+            }
+
+            // Handle remaining B elements
+            for (; b_idx < b_nnz; b_idx++) {
+                if (b_rows[b_idx] == a_k && b_cols[b_idx] == j) {
+                    sum += a_val * float(b_data[b_idx]);
+                }
             }
         }
     }
 }
 
-out_data[tid] = sum;
+// Handle remaining A elements
+for (; a_idx < a_nnz; a_idx++) {
+    if (a_rows[a_idx] == i) {
+        int k = a_cols[a_idx];
+        float a_val = float(a_data[a_idx]);
+
+        // Find matching column in B (k-th row of B) with SIMD
+        int b_idx = 0;
+        for (; b_idx + 3 < b_nnz; b_idx += 4) {
+            simd_int4 b_rows_vec = simd_int4(b_rows[b_idx], b_rows[b_idx+1], b_rows[b_idx+2], b_rows[b_idx+3]);
+            simd_int4 b_cols_vec = simd_int4(b_cols[b_idx], b_cols[b_idx+1], b_cols[b_idx+2], b_cols[b_idx+3]);
+            simd_int4 k_vec = simd_int4(k);
+            simd_int4 j_vec = simd_int4(j);
+
+            simd_float4 match = simd_float4((b_rows_vec == k_vec) & (b_cols_vec == j_vec));
+            simd_float4 b_vals = simd_float4(
+                float(b_data[b_idx]),
+                float(b_data[b_idx+1]),
+                float(b_data[b_idx+2]),
+                float(b_data[b_idx+3])
+            );
+            simd_float4 prod = match * b_vals;
+            sum += a_val * (prod[0] + prod[1] + prod[2] + prod[3]);
+        }
+
+        for (; b_idx < b_nnz; b_idx++) {
+            if (b_rows[b_idx] == k && b_cols[b_idx] == j) {
+                sum += a_val * float(b_data[b_idx]);
+            }
+        }
+    }
+}
+
+out_data[tid] = bfloat16_t(sum);
 """
 
 sparse_vector_matmul_source = """
 // Sparse matrix-vector multiplication: y = A @ x
 // A is in COO format (rows, cols, data)
 // x is a dense vector
+// Heavily optimized with SIMD, float32 accumulation, and loop unrolling
 uint tid = thread_position_in_grid.x;
 if (tid >= n_rows) return;
 
-bfloat16_t sum = bfloat16_t(0);
+// Use float32 for accumulation to reduce precision loss
+float sum = 0.0f;
+int tid_int = int(tid);
 
-// Sum all non-zeros in this row
-for (int i = 0; i < nnz; i++) {
-    if (mat_rows[i] == int(tid)) {
-        sum += mat_data[i] * vec[mat_cols[i]];
+// Multiple SIMD accumulators for better instruction-level parallelism
+simd_float4 acc0 = simd_float4(0);
+simd_float4 acc1 = simd_float4(0);
+
+// Sum all non-zeros in this row, process 8 at a time (2x unrolled 4-wide SIMD)
+int i = 0;
+for (; i + 7 < nnz; i += 8) {
+    // First 4 elements
+    simd_int4 row_vec0 = simd_int4(mat_rows[i], mat_rows[i+1], mat_rows[i+2], mat_rows[i+3]);
+    simd_int4 tid_vec = simd_int4(tid_int);
+
+    // Use select for branchless SIMD
+    simd_float4 match0 = simd_float4(row_vec0 == tid_vec);
+    simd_float4 vals0 = simd_float4(
+        float(mat_data[i]) * float(vec[mat_cols[i]]),
+        float(mat_data[i+1]) * float(vec[mat_cols[i+1]]),
+        float(mat_data[i+2]) * float(vec[mat_cols[i+2]]),
+        float(mat_data[i+3]) * float(vec[mat_cols[i+3]])
+    );
+    acc0 += match0 * vals0;
+
+    // Second 4 elements
+    simd_int4 row_vec1 = simd_int4(mat_rows[i+4], mat_rows[i+5], mat_rows[i+6], mat_rows[i+7]);
+    simd_float4 match1 = simd_float4(row_vec1 == tid_vec);
+    simd_float4 vals1 = simd_float4(
+        float(mat_data[i+4]) * float(vec[mat_cols[i+4]]),
+        float(mat_data[i+5]) * float(vec[mat_cols[i+5]]),
+        float(mat_data[i+6]) * float(vec[mat_cols[i+6]]),
+        float(mat_data[i+7]) * float(vec[mat_cols[i+7]])
+    );
+    acc1 += match1 * vals1;
+}
+
+// Reduce accumulators manually
+sum = acc0[0] + acc0[1] + acc0[2] + acc0[3] + acc1[0] + acc1[1] + acc1[2] + acc1[3];
+
+// Process remaining 4 elements with 4-wide SIMD
+if (i + 3 < nnz) {
+    simd_int4 row_vec = simd_int4(mat_rows[i], mat_rows[i+1], mat_rows[i+2], mat_rows[i+3]);
+    simd_int4 tid_vec = simd_int4(tid_int);
+    simd_float4 match = simd_float4(row_vec == tid_vec);
+    simd_float4 vals = simd_float4(
+        float(mat_data[i]) * float(vec[mat_cols[i]]),
+        float(mat_data[i+1]) * float(vec[mat_cols[i+1]]),
+        float(mat_data[i+2]) * float(vec[mat_cols[i+2]]),
+        float(mat_data[i+3]) * float(vec[mat_cols[i+3]])
+    );
+    simd_float4 result = match * vals;
+    sum += result[0] + result[1] + result[2] + result[3];
+    i += 4;
+}
+
+// Handle remaining elements
+for (; i < nnz; i++) {
+    if (mat_rows[i] == tid_int) {
+        sum += float(mat_data[i]) * float(vec[mat_cols[i]]);
     }
 }
 
-out[tid] = sum;
+out[tid] = bfloat16_t(sum);
 """
 
 masked_correlation_source = """
 // Compute masked correlation: mask * (X.T @ X) / batch_size
 // X is (batch_size, n_features), result is sparse where mask is non-zero
+// Heavily optimized with SIMD, float32 accumulation, and loop unrolling
 uint tid = thread_position_in_grid.x;
 if (tid >= mask_nnz) return;
 
 int i = mask_rows[tid];
 int j = mask_cols[tid];
 
-bfloat16_t sum = bfloat16_t(0);
+// Multiple SIMD accumulators for better instruction-level parallelism
+simd_float4 acc0 = simd_float4(0);
+simd_float4 acc1 = simd_float4(0);
+simd_float4 acc2 = simd_float4(0);
+simd_float4 acc3 = simd_float4(0);
+float sum = 0.0f;
 
-// Compute dot product of column i and column j
-for (int b = 0; b < batch_size; b++) {
-    sum += X[b * n_features + i] * X[b * n_features + j];
+// Compute dot product with aggressive unrolling - 16 elements at a time
+int b = 0;
+for (; b + 15 < batch_size; b += 16) {
+    // Unroll 4x for better ILP
+    simd_float4 xi0 = simd_float4(
+        float(X[(b + 0) * n_features + i]),
+        float(X[(b + 1) * n_features + i]),
+        float(X[(b + 2) * n_features + i]),
+        float(X[(b + 3) * n_features + i])
+    );
+    simd_float4 xj0 = simd_float4(
+        float(X[(b + 0) * n_features + j]),
+        float(X[(b + 1) * n_features + j]),
+        float(X[(b + 2) * n_features + j]),
+        float(X[(b + 3) * n_features + j])
+    );
+    acc0 += xi0 * xj0;
+
+    simd_float4 xi1 = simd_float4(
+        float(X[(b + 4) * n_features + i]),
+        float(X[(b + 5) * n_features + i]),
+        float(X[(b + 6) * n_features + i]),
+        float(X[(b + 7) * n_features + i])
+    );
+    simd_float4 xj1 = simd_float4(
+        float(X[(b + 4) * n_features + j]),
+        float(X[(b + 5) * n_features + j]),
+        float(X[(b + 6) * n_features + j]),
+        float(X[(b + 7) * n_features + j])
+    );
+    acc1 += xi1 * xj1;
+
+    simd_float4 xi2 = simd_float4(
+        float(X[(b + 8) * n_features + i]),
+        float(X[(b + 9) * n_features + i]),
+        float(X[(b + 10) * n_features + i]),
+        float(X[(b + 11) * n_features + i])
+    );
+    simd_float4 xj2 = simd_float4(
+        float(X[(b + 8) * n_features + j]),
+        float(X[(b + 9) * n_features + j]),
+        float(X[(b + 10) * n_features + j]),
+        float(X[(b + 11) * n_features + j])
+    );
+    acc2 += xi2 * xj2;
+
+    simd_float4 xi3 = simd_float4(
+        float(X[(b + 12) * n_features + i]),
+        float(X[(b + 13) * n_features + i]),
+        float(X[(b + 14) * n_features + i]),
+        float(X[(b + 15) * n_features + i])
+    );
+    simd_float4 xj3 = simd_float4(
+        float(X[(b + 12) * n_features + j]),
+        float(X[(b + 13) * n_features + j]),
+        float(X[(b + 14) * n_features + j]),
+        float(X[(b + 15) * n_features + j])
+    );
+    acc3 += xi3 * xj3;
 }
 
-out_data[tid] = sum / bfloat16_t(batch_size);
+// Reduce all accumulators manually
+sum = acc0[0] + acc0[1] + acc0[2] + acc0[3] +
+      acc1[0] + acc1[1] + acc1[2] + acc1[3] +
+      acc2[0] + acc2[1] + acc2[2] + acc2[3] +
+      acc3[0] + acc3[1] + acc3[2] + acc3[3];
+
+// Process remaining 8 elements
+if (b + 7 < batch_size) {
+    simd_float4 xi0 = simd_float4(
+        float(X[(b + 0) * n_features + i]),
+        float(X[(b + 1) * n_features + i]),
+        float(X[(b + 2) * n_features + i]),
+        float(X[(b + 3) * n_features + i])
+    );
+    simd_float4 xj0 = simd_float4(
+        float(X[(b + 0) * n_features + j]),
+        float(X[(b + 1) * n_features + j]),
+        float(X[(b + 2) * n_features + j]),
+        float(X[(b + 3) * n_features + j])
+    );
+    simd_float4 prod0 = xi0 * xj0;
+    simd_float4 xi1 = simd_float4(
+        float(X[(b + 4) * n_features + i]),
+        float(X[(b + 5) * n_features + i]),
+        float(X[(b + 6) * n_features + i]),
+        float(X[(b + 7) * n_features + i])
+    );
+    simd_float4 xj1 = simd_float4(
+        float(X[(b + 4) * n_features + j]),
+        float(X[(b + 5) * n_features + j]),
+        float(X[(b + 6) * n_features + j]),
+        float(X[(b + 7) * n_features + j])
+    );
+    simd_float4 prod1 = xi1 * xj1;
+    sum += prod0[0] + prod0[1] + prod0[2] + prod0[3] + prod1[0] + prod1[1] + prod1[2] + prod1[3];
+    b += 8;
+}
+
+// Process remaining 4 elements with 4-wide SIMD
+if (b + 3 < batch_size) {
+    simd_float4 xi = simd_float4(
+        float(X[(b + 0) * n_features + i]),
+        float(X[(b + 1) * n_features + i]),
+        float(X[(b + 2) * n_features + i]),
+        float(X[(b + 3) * n_features + i])
+    );
+    simd_float4 xj = simd_float4(
+        float(X[(b + 0) * n_features + j]),
+        float(X[(b + 1) * n_features + j]),
+        float(X[(b + 2) * n_features + j]),
+        float(X[(b + 3) * n_features + j])
+    );
+    simd_float4 prod = xi * xj;
+    sum += prod[0] + prod[1] + prod[2] + prod[3];
+    b += 4;
+}
+
+// Handle remaining elements
+for (; b < batch_size; b++) {
+    sum += float(X[b * n_features + i]) * float(X[b * n_features + j]);
+}
+
+out_data[tid] = bfloat16_t(sum / float(batch_size));
 """
 
 masked_matmul_kernel = mx.fast.metal_kernel(
@@ -228,11 +469,23 @@ class Matrix:
         self.nnz = data.shape[0]
 
     def to_dense(self) -> mx.array:
-        """Convert sparse matrix to dense format."""
+        """Convert sparse matrix to dense format (compile-safe version).
+
+        This version works in both regular and compiled contexts by avoiding .item() calls.
+        Instead, it uses MLX's built-in indexing with integer arrays.
+        """
         dense = mx.zeros(self.shape, dtype=self.dtype)
-        # Use scatter to efficiently set values
-        for i in range(self.nnz):
-            dense[self.rows[i].item(), self.cols[i].item()] = self.data[i]
+
+        # MLX supports indexing with integer arrays directly
+        # Create linear indices: idx = row * ncols + col
+        linear_indices = self.rows * self.shape[1] + self.cols
+
+        # Flatten, scatter values, then reshape
+        flat = dense.reshape(-1)
+        # Use MLX's array indexing (no .item() needed!)
+        flat = flat.at[linear_indices].add(self.data)
+        dense = flat.reshape(self.shape)
+
         return dense
 
     def masked_matmul(self, other: 'Matrix', mask: 'Matrix') -> 'Matrix':

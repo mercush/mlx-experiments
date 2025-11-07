@@ -4,7 +4,7 @@ import random
 import networkx as nx
 import dwave_networkx as dnx
 
-epochs = 2
+epochs = 1
 learning_rate = 0.003
 alpha = 0.6
 batch_size = 128
