@@ -1,4 +1,5 @@
 import mlx.core as mx
+from functools import partial
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import NamedTuple
@@ -12,7 +13,8 @@ class TrainingState(NamedTuple):
     biases_vel: mx.array
     error: mx.array
 
-@mx.compile
+state = [mx.random.state]
+@partial(mx.compile, inputs=state, outputs=state)
 def ising_bernoulli(p):
     """
     Generate a Bernoulli random variable with probability p.
@@ -95,7 +97,7 @@ def compute_reconstruction_error(
     error = mx.mean((clamps - reconstruction_clamps) ** 2)
     return error
 
-@mx.compile
+@partial(mx.compile, inputs=state, outputs=state)
 def train_step(
     state: TrainingState, batch_img: mx.array, batch_label: mx.array
 ) -> TrainingState:
