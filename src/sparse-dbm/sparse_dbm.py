@@ -16,7 +16,6 @@ class TrainingState(NamedTuple):
     biases: mx.array
     weight_vel_data: mx.array  # Velocity for sparse weight data only
     biases_vel: mx.array
-    error: mx.array
 
 state = [mx.random.state]
 
@@ -134,7 +133,7 @@ def train_step(
     Perform a single training step with fully sparse operations.
     Uses sparse matrix-vector multiplication in Gibbs sampling and sparse correlation.
     """
-    weight_rows, weight_cols, weight_data, biases, weight_vel_data, biases_vel, _ = state
+    weight_rows, weight_cols, weight_data, biases, weight_vel_data, biases_vel = state
     batch = batch_img + batch_label
 
     # Reconstruct sparse weights
@@ -180,16 +179,6 @@ def train_step(
     new_weight_data = weight_data + delta_weight_data
     new_biases = biases + delta_biases
 
-    # Reconstruct new weights for error computation
-    new_weights = sparse.Matrix(
-        weight_rows,
-        weight_cols,
-        new_weight_data,
-        (consts.num_neurons, consts.num_neurons),
-        consts.dtype,
-    )
-    error = compute_reconstruction_error(new_weights, new_biases, batch)
-
     return TrainingState(
         weight_rows,
         weight_cols,
@@ -197,16 +186,13 @@ def train_step(
         new_biases,
         delta_weight_data,
         delta_biases,
-        error,
     )
 
 
 if __name__ == "__main__":
     # Convert graph mask to sparse format
-    print("Converting graph mask to sparse format...")
+    print("Training Sparse DBM")
     graph_mask_sparse = sparse.from_dense(consts.graph_mask, dtype=consts.dtype)
-    print(f"Graph mask: {graph_mask_sparse.shape}, nnz: {graph_mask_sparse.nnz}")
-    print("  -> Will use fully sparse operations (matrix-vector and correlation)")
 
     # Initialize weights (sparse)
     weights_dense = consts.graph_mask * mx.random.normal(
@@ -217,13 +203,12 @@ if __name__ == "__main__":
 
     # Initialize state with sparse weight components
     state = TrainingState(
-        weight_rows=weights_sparse.rows,
+        weight_rows=weights_sparse.row_ptr,
         weight_cols=weights_sparse.cols,
         weight_data=weights_sparse.data,
         biases=biases,
         weight_vel_data=mx.zeros_like(weights_sparse.data),
         biases_vel=mx.zeros_like(biases),
-        error=mx.array(0.0),
     )
     errors = []
     for epoch in range(consts.epochs):
@@ -242,9 +227,27 @@ if __name__ == "__main__":
                 mx.eval(state)
                 pbar.update(consts.batch_size)
                 pbar.set_postfix(
-                    error=state[-1].item(), peak_memory=mx.get_peak_memory() / 1e9
+                    peak_memory=mx.get_peak_memory() / 1e9
                 )
-                errors.append(state[-1].item())
+            # reconstruction error on train
+            new_weights = sparse.Matrix(
+                    state[0],
+                    state[1],
+                    state[2],
+                    (consts.num_neurons, consts.num_neurons),
+                    consts.dtype,
+                )
+            new_bias = state[3]
+            batch = consts.random_transform_train_imgs[-consts.batch_size:] + \
+                consts.random_transform_train_labels[-consts.batch_size:]
+            error = compute_reconstruction_error(
+                new_weights,
+                new_bias,
+                batch
+            )
+            error_eval = error.item()
+            pbar.set_postfix(error=error_eval)
+            errors.append(error_eval)
     plt.plot(errors)
     plt.ylabel("Reconstruction Error")
     plt.savefig("training_error.png")

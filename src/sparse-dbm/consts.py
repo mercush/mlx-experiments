@@ -4,10 +4,10 @@ import random
 import networkx as nx
 import dwave_networkx as dnx
 
-epochs = 1
+epochs = 10
 learning_rate = 0.003
 alpha = 0.6
-batch_size = 128
+batch_size = 512
 sample_iter = 10
 dtype = mx.bfloat16
 
