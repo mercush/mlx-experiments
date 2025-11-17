@@ -87,22 +87,37 @@ sparse_vector_matmul_kernel = mx.fast.metal_kernel(
     name="sparse_vector_matmul",
     input_names=["row_ptr", "mat_cols", "mat_data", "vec", "n_rows"],
     output_names=["out"],
-    source=sparse_vector_matmul_source
+    source=sparse_vector_matmul_source,
 )
 
 sparse_matrix_matmul_kernel = mx.fast.metal_kernel(
     name="sparse_matrix_matmul",
-    input_names=["row_ptr", "mat_cols", "mat_data", "dense_mat", "n_rows", "n_cols_out"],
+    input_names=[
+        "row_ptr",
+        "mat_cols",
+        "mat_data",
+        "dense_mat",
+        "n_rows",
+        "n_cols_out",
+    ],
     output_names=["out"],
-    source=sparse_matrix_matmul_source
+    source=sparse_matrix_matmul_source,
 )
 
 masked_correlation_kernel = mx.fast.metal_kernel(
     name="masked_correlation",
-    input_names=["X", "mask_row_ptr", "mask_cols", "batch_size", "n_features", "mask_nnz"],
+    input_names=[
+        "X",
+        "mask_row_ptr",
+        "mask_cols",
+        "batch_size",
+        "n_features",
+        "mask_nnz",
+    ],
     output_names=["out_data"],
-    source=masked_correlation_source
+    source=masked_correlation_source,
 )
+
 
 def _sparse_vector_matmul(
     row_ptr: mx.array,
@@ -129,15 +144,16 @@ def _sparse_vector_matmul(
     # Use the dtype of the input data (prefer vec dtype if both are present)
     output_dtype = vec.dtype if vec.dtype == mx.bfloat16 else mat_data.dtype
 
-    outputs = sparse_vector_matmul_kernel( # pyright: ignore
-            inputs=[row_ptr, mat_cols, mat_data, vec, n_rows_array],
-            grid=(n_rows, 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(n_rows,)],
-            output_dtypes=[output_dtype],
-            stream=mx.gpu
+    outputs = sparse_vector_matmul_kernel(  # pyright: ignore
+        inputs=[row_ptr, mat_cols, mat_data, vec, n_rows_array],
+        grid=(n_rows, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n_rows,)],
+        output_dtypes=[output_dtype],
+        stream=mx.gpu,
     )
     return outputs[0]
+
 
 def _sparse_matrix_matmul(
     row_ptr: mx.array,
@@ -166,15 +182,16 @@ def _sparse_matrix_matmul(
     # Use the dtype of the input data (prefer dense_mat dtype if both are present)
     output_dtype = dense_mat.dtype if dense_mat.dtype == mx.bfloat16 else mat_data.dtype
 
-    outputs = sparse_matrix_matmul_kernel( # pyright: ignore
-            inputs=[row_ptr, mat_cols, mat_data, dense_mat, n_rows_array, n_cols_out_array],
-            grid=(n_rows, n_cols_out, 1),
-            threadgroup=(16, 16, 1),
-            output_shapes=[(n_rows * n_cols_out,)],
-            output_dtypes=[output_dtype],
-            stream=mx.gpu
+    outputs = sparse_matrix_matmul_kernel(  # pyright: ignore
+        inputs=[row_ptr, mat_cols, mat_data, dense_mat, n_rows_array, n_cols_out_array],
+        grid=(n_rows, n_cols_out, 1),
+        threadgroup=(16, 16, 1),
+        output_shapes=[(n_rows * n_cols_out,)],
+        output_dtypes=[output_dtype],
+        stream=mx.gpu,
     )
     return outputs[0].reshape(n_rows, n_cols_out)
+
 
 def _masked_correlation(
     X: mx.array,
@@ -199,22 +216,30 @@ def _masked_correlation(
     # Use the dtype of the input matrix X
     output_dtype = X.dtype
 
-    outputs = masked_correlation_kernel( # pyright: ignore
-            inputs=[X, mask_row_ptr, mask_cols, batch_size, n_features, mask_nnz],
-            grid=(mask_nnz.item(), 1, 1),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(mask_nnz.item(),)],
-            output_dtypes=[output_dtype],
-            stream=mx.gpu
+    outputs = masked_correlation_kernel(  # pyright: ignore
+        inputs=[X, mask_row_ptr, mask_cols, batch_size, n_features, mask_nnz],
+        grid=(mask_nnz.item(), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(mask_nnz.item(),)],
+        output_dtypes=[output_dtype],
+        stream=mx.gpu,
     )
     return outputs[0]
+
 
 class Matrix:
     """
     A sparse matrix representation using MLX arrays in CSR (Compressed Sparse Row) format.
     """
 
-    def __init__(self, row_ptr: mx.array, cols: mx.array, data: mx.array, shape: tuple, dtype: mx.Dtype = mx.bfloat16):
+    def __init__(
+        self,
+        row_ptr: mx.array,
+        cols: mx.array,
+        data: mx.array,
+        shape: tuple,
+        dtype: mx.Dtype = mx.bfloat16,
+    ):
         """
         Initialize a sparse matrix in CSR format.
 
@@ -247,6 +272,7 @@ class Matrix:
                 )
         else:
             return NotImplemented
+
 
 def from_dense(dense: mx.array, dtype=None) -> Matrix:
     """
@@ -286,6 +312,7 @@ def from_dense(dense: mx.array, dtype=None) -> Matrix:
     data = mx.array(data, dtype=dtype)
 
     return Matrix(row_ptr, cols, data, dense.shape, dtype)
+
 
 def masked_correlation(X: mx.array, mask: Matrix) -> Matrix:
     """
