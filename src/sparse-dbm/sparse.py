@@ -1,27 +1,6 @@
 import mlx.core as mx
 import numpy as np
 
-sparse_vector_matmul_source = """
-// Sparse matrix-vector multiplication: y = A @ x
-// A is in CSR format (row_ptr, cols, data)
-// x is a dense vector
-uint tid = thread_position_in_grid.x;
-if (tid >= n_rows) return;
-
-bfloat16_t sum = bfloat16_t(0);
-
-// CSR: direct lookup of row start and end
-int row_start = row_ptr[tid];
-int row_end = row_ptr[tid + 1];
-
-// Iterate through all entries in this row
-for (int idx = row_start; idx < row_end; idx++) {
-    sum += mat_data[idx] * vec[mat_cols[idx]];
-}
-
-out[tid] = sum;
-"""
-
 sparse_matrix_matmul_source = """
 // Sparse matrix-dense matrix multiplication: Y = A @ X
 // A is in CSR format (row_ptr, cols, data) - shape (n_rows, n_cols_A)
