@@ -51,26 +51,11 @@ out[row_tid * n_cols_out + col_tid] = sum;
 masked_correlation_source = """
 // Compute masked correlation: mask * (X.T @ X) / batch_size
 // X is (batch_size, n_features), result is sparse where mask is non-zero
-// mask is in CSR format (mask_row_ptr, mask_cols)
+// mask is in COO format (mask_rows, mask_cols) for efficient element-wise access
 uint tid = thread_position_in_grid.x;
 if (tid >= mask_nnz) return;
 
-// Find which row this element belongs to using row_ptr
-// Binary search to find row: largest i where mask_row_ptr[i] <= tid
-int row_i = 0;
-int left = 0;
-int right = n_features;
-
-while (left < right) {
-    int mid = left + (right - left) / 2;
-    if (mask_row_ptr[mid + 1] <= int(tid)) {
-        left = mid + 1;
-    } else {
-        right = mid;
-    }
-}
-row_i = left;
-
+int row_i = mask_rows[tid];
 int col_j = mask_cols[tid];
 
 bfloat16_t sum = bfloat16_t(0);
@@ -108,7 +93,7 @@ masked_correlation_kernel = mx.fast.metal_kernel(
     name="masked_correlation",
     input_names=[
         "X",
-        "mask_row_ptr",
+        "mask_rows",
         "mask_cols",
         "batch_size",
         "n_features",
@@ -195,7 +180,7 @@ def _sparse_matrix_matmul(
 
 def _masked_correlation(
     X: mx.array,
-    mask_row_ptr: mx.array,
+    mask_rows: mx.array,
     mask_cols: mx.array,
 ) -> mx.array:
     """
@@ -203,7 +188,7 @@ def _masked_correlation(
 
     Args:
         X: Dense matrix of shape (batch_size, n_features)
-        mask_row_ptr: CSR row pointer array for the mask
+        mask_rows: COO row indices for the mask
         mask_cols: Column indices where to compute correlation
 
     Returns:
@@ -217,7 +202,7 @@ def _masked_correlation(
     output_dtype = X.dtype
 
     outputs = masked_correlation_kernel(  # pyright: ignore
-        inputs=[X, mask_row_ptr, mask_cols, batch_size, n_features, mask_nnz],
+        inputs=[X, mask_rows, mask_cols, batch_size, n_features, mask_nnz],
         grid=(mask_nnz.item(), 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(mask_nnz.item(),)],
@@ -229,22 +214,25 @@ def _masked_correlation(
 
 class Matrix:
     """
-    A sparse matrix representation using MLX arrays in CSR (Compressed Sparse Row) format.
+    A sparse matrix representation using MLX arrays in hybrid COO/CSR format.
+    Stores both row indices (COO) and row pointers (CSR) for optimal kernel performance.
     """
 
     def __init__(
         self,
         row_ptr: mx.array,
+        rows: mx.array,
         cols: mx.array,
         data: mx.array,
         shape: tuple,
         dtype: mx.Dtype = mx.bfloat16,
     ):
         """
-        Initialize a sparse matrix in CSR format.
+        Initialize a sparse matrix in hybrid COO/CSR format.
 
         Args:
             row_ptr: CSR row pointer array (size n_rows + 1)
+            rows: COO row indices of non-zero values
             cols: Column indices of non-zero values
             data: The non-zero values of the matrix
             shape: The shape of the matrix (n_rows, n_cols)
@@ -253,6 +241,7 @@ class Matrix:
         self.shape = shape
         self.dtype = dtype
         self.row_ptr = row_ptr.astype(mx.int32)
+        self.rows = rows.astype(mx.int32)
         self.cols = cols.astype(mx.int32)
         self.data = data.astype(dtype)
         self.nnz = data.shape[0]
@@ -283,7 +272,7 @@ def from_dense(dense: mx.array, dtype=None) -> Matrix:
         dtype: Data type (if None, uses dense array's dtype)
 
     Returns:
-        A sparse Matrix object in CSR format
+        A sparse Matrix object in hybrid COO/CSR format
     """
     if dtype is None:
         dtype = dense.dtype
@@ -307,11 +296,13 @@ def from_dense(dense: mx.array, dtype=None) -> Matrix:
         row_ptr[rows[i] + 1] += 1
     np.cumsum(row_ptr, out=row_ptr)
 
+    # Convert to MLX arrays
     row_ptr = mx.array(row_ptr, dtype=mx.int32)
+    rows = mx.array(rows, dtype=mx.int32)  # Keep COO row indices
     cols = mx.array(cols, dtype=mx.int32)
     data = mx.array(data, dtype=dtype)
 
-    return Matrix(row_ptr, cols, data, dense.shape, dtype)
+    return Matrix(row_ptr, rows, cols, data, dense.shape, dtype)
 
 
 def masked_correlation(X: mx.array, mask: Matrix) -> Matrix:
@@ -327,5 +318,5 @@ def masked_correlation(X: mx.array, mask: Matrix) -> Matrix:
     Returns:
         Sparse matrix containing correlation values at mask positions
     """
-    out_data = _masked_correlation(X, mask.row_ptr, mask.cols)
-    return Matrix(mask.row_ptr, mask.cols, out_data, mask.shape, X.dtype)
+    out_data = _masked_correlation(X, mask.rows, mask.cols)
+    return Matrix(mask.row_ptr, mask.rows, mask.cols, out_data, mask.shape, X.dtype)

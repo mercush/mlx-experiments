@@ -10,7 +10,8 @@ import sparse
 
 class TrainingState(NamedTuple):
     # Store sparse weights as separate arrays for compile compatibility
-    weight_rows: mx.array
+    weight_row_ptr: mx.array  # CSR row pointers
+    weight_rows: mx.array     # COO row indices
     weight_cols: mx.array
     weight_data: mx.array
     biases: mx.array
@@ -133,11 +134,12 @@ def train_step(
     Perform a single training step with fully sparse operations.
     Uses sparse matrix-vector multiplication in Gibbs sampling and sparse correlation.
     """
-    weight_rows, weight_cols, weight_data, biases, weight_vel_data, biases_vel = state
+    weight_row_ptr, weight_rows, weight_cols, weight_data, biases, weight_vel_data, biases_vel = state
     batch = batch_img + batch_label
 
     # Reconstruct sparse weights
     weights = sparse.Matrix(
+        weight_row_ptr,
         weight_rows,
         weight_cols,
         weight_data,
@@ -148,6 +150,7 @@ def train_step(
     # Reconstruct sparse mask for correlation kernel
     mask_data = mx.ones_like(weight_rows).astype(consts.dtype)
     graph_mask_sparse = sparse.Matrix(
+        weight_row_ptr,
         weight_rows,
         weight_cols,
         mask_data,
@@ -180,6 +183,7 @@ def train_step(
     new_biases = biases + delta_biases
 
     return TrainingState(
+        weight_row_ptr,
         weight_rows,
         weight_cols,
         new_weight_data,
@@ -203,7 +207,8 @@ if __name__ == "__main__":
 
     # Initialize state with sparse weight components
     state = TrainingState(
-        weight_rows=weights_sparse.row_ptr,
+        weight_row_ptr=weights_sparse.row_ptr,
+        weight_rows=weights_sparse.rows,
         weight_cols=weights_sparse.cols,
         weight_data=weights_sparse.data,
         biases=biases,
@@ -231,13 +236,14 @@ if __name__ == "__main__":
                 )
             # reconstruction error on train
             new_weights = sparse.Matrix(
-                    state[0],
-                    state[1],
-                    state[2],
+                    state[0],  # weight_row_ptr
+                    state[1],  # weight_rows
+                    state[2],  # weight_cols
+                    state[3],  # weight_data
                     (consts.num_neurons, consts.num_neurons),
                     consts.dtype,
                 )
-            new_bias = state[3]
+            new_bias = state[4]  # biases
             batch = consts.random_transform_train_imgs[-consts.batch_size:] + \
                 consts.random_transform_train_labels[-consts.batch_size:]
             error = compute_reconstruction_error(
