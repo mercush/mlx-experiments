@@ -8,7 +8,7 @@ epochs = 10
 learning_rate = 0.003
 alpha = 0.6
 batch_size = 256
-sample_iter = 100
+sample_iter = 10
 dtype = mx.bfloat16
 
 with open("coloring.txt", "r") as f:
