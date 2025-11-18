@@ -31,28 +31,58 @@ masked_correlation_source = """
 // Compute masked correlation: mask * (X.T @ X) / batch_size
 // X is (batch_size, n_features), result is sparse where mask is non-zero
 // mask is in COO format (mask_rows, mask_cols) for efficient element-wise access
-uint tid = thread_position_in_grid.x;
-if (tid >= mask_nnz) return;
+// Optimized with SIMD operations and threadgroup memory for parallel reduction
 
-int row_i = mask_rows[tid];
-int col_j = mask_cols[tid];
+constexpr int N_READS = 4;
+constexpr int SIMD_SIZE = 32;
 
-bfloat16_t sum = bfloat16_t(0);
+uint gid = threadgroup_position_in_grid.x;
+uint tid = thread_position_in_threadgroup.x;
+uint simd_lane_id = thread_index_in_simdgroup;
+uint simd_group_id = simdgroup_index_in_threadgroup;
 
-// Compute dot product of column row_i and column col_j
-for (int b = 0; b < batch_size; b++) {
-    sum += X[b * n_features + row_i] * X[b * n_features + col_j];
+if (gid >= mask_nnz) return;
+
+// Allocate threadgroup memory for SIMD group partial sums
+// Size 32 supports up to 1024 threads (32 SIMD groups)
+threadgroup float local_sum[32];
+
+int row_i = mask_rows[gid];
+int col_j = mask_cols[gid];
+
+// Each thread processes N_READS elements at a time for better memory bandwidth
+// Stride by 256 (threadgroup size as configured in kernel launch)
+float partial_sum = 0.0f;
+for (int b = tid * N_READS; b < batch_size; b += 256 * N_READS) {
+    for (int i = 0; i < N_READS; i++) {
+        int batch_idx = b + i;
+        if (batch_idx < batch_size) {
+            bfloat16_t x_i = X[batch_idx * n_features + row_i];
+            bfloat16_t x_j = X[batch_idx * n_features + col_j];
+            partial_sum += float(x_i) * float(x_j);
+        }
+    }
 }
 
-out_data[tid] = sum / bfloat16_t(batch_size);
-"""
+// First reduction: within each SIMD group (32 threads) using hardware shuffle
+partial_sum = simd_sum(partial_sum);
 
-sparse_vector_matmul_kernel = mx.fast.metal_kernel(
-    name="sparse_vector_matmul",
-    input_names=["row_ptr", "mat_cols", "mat_data", "vec", "n_rows"],
-    output_names=["out"],
-    source=sparse_vector_matmul_source,
-)
+// Store each SIMD group's result in threadgroup memory
+if (simd_lane_id == 0) {
+    local_sum[simd_group_id] = partial_sum;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// Second reduction: across SIMD groups (first SIMD group does the work)
+// With 256 threads, we have 8 SIMD groups to reduce
+if (simd_group_id == 0) {
+    float total = (simd_lane_id < 8) ? local_sum[simd_lane_id] : 0.0f;
+    total = simd_sum(total);
+    if (simd_lane_id == 0) {
+        out_data[gid] = bfloat16_t(total / float(batch_size));
+    }
+}
+"""
 
 sparse_matrix_matmul_kernel = mx.fast.metal_kernel(
     name="sparse_matrix_matmul",
