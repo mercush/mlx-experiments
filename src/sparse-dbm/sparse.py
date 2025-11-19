@@ -6,82 +6,98 @@ sparse_matrix_matmul_source = """
 // A is in CSR format (row_ptr, cols, data) - shape (n_rows, n_cols_A)
 // X is a dense matrix - shape (n_cols_A, n_cols_X)
 // Y is output dense matrix - shape (n_rows, n_cols_X)
+
 uint row_tid = thread_position_in_grid.x;
-uint col_tid = thread_position_in_grid.y;
+uint col_vec_idx = thread_position_in_grid.y;
 
-if (row_tid >= n_rows || col_tid >= n_cols_out) return;
+// Vector size
+constexpr int BM = 4;
+int col_idx = col_vec_idx * BM;
 
-bfloat16_t sum = bfloat16_t(0);
+if (row_tid >= uint(n_rows) || col_idx >= uint(n_cols_out)) return;
 
-// CSR: direct lookup of row start and end
+// Check for full vector
+bool full_vector = (col_idx + BM <= n_cols_out);
+
+float4 sum = float4(0.0f);
+
 int row_start = row_ptr[row_tid];
 int row_end = row_ptr[row_tid + 1];
 
-// Iterate through all entries in this row
-for (int idx = row_start; idx < row_end; idx++) {
-    int k = mat_cols[idx];
-    // X is stored in row-major: X[k, col_tid] = X[k * n_cols_out + col_tid]
-    sum += mat_data[idx] * dense_mat[k * n_cols_out + col_tid];
+if (full_vector) {
+    for (int idx = row_start; idx < row_end; idx++) {
+        int k = mat_cols[idx];
+        float val_a = float(mat_data[idx]);
+        
+        // Vectorized read of 4 bfloat16 values
+        // Use packed_short4 to handle potential unalignment
+        device const packed_short4* src = (device const packed_short4*)(dense_mat + k * n_cols_out + col_idx);
+        short4 raw = *src;
+        
+        // Unpack bfloat16 to float using intermediate array to allow address taking
+        short raw_arr[4] = {raw.x, raw.y, raw.z, raw.w};
+        
+        bfloat16_t v0 = *(thread bfloat16_t*)&raw_arr[0];
+        bfloat16_t v1 = *(thread bfloat16_t*)&raw_arr[1];
+        bfloat16_t v2 = *(thread bfloat16_t*)&raw_arr[2];
+        bfloat16_t v3 = *(thread bfloat16_t*)&raw_arr[3];
+        
+        float4 val_x = float4(float(v0), float(v1), float(v2), float(v3));
+        sum += val_a * val_x;
+    }
+    
+    // Store result
+    bfloat16_t r0 = bfloat16_t(sum.x);
+    bfloat16_t r1 = bfloat16_t(sum.y);
+    bfloat16_t r2 = bfloat16_t(sum.z);
+    bfloat16_t r3 = bfloat16_t(sum.w);
+    
+    short res_arr[4];
+    *(thread bfloat16_t*)&res_arr[0] = r0;
+    *(thread bfloat16_t*)&res_arr[1] = r1;
+    *(thread bfloat16_t*)&res_arr[2] = r2;
+    *(thread bfloat16_t*)&res_arr[3] = r3;
+    
+    short4 res = short4(res_arr[0], res_arr[1], res_arr[2], res_arr[3]);
+    
+    *((device packed_short4*)(out + row_tid * n_cols_out + col_idx)) = res;
+    
+} else {
+    // Handle tail (scalar loop)
+    for (int idx = row_start; idx < row_end; idx++) {
+        int k = mat_cols[idx];
+        float val_a = float(mat_data[idx]);
+        
+        for (int i = 0; i < n_cols_out - col_idx; i++) {
+            float val_x = float(dense_mat[k * n_cols_out + col_idx + i]);
+            sum[i] += val_a * val_x;
+        }
+    }
+    
+    for (int i = 0; i < n_cols_out - col_idx; i++) {
+        out[row_tid * n_cols_out + col_idx + i] = bfloat16_t(sum[i]);
+    }
 }
-
-out[row_tid * n_cols_out + col_tid] = sum;
 """
 
 masked_correlation_source = """
 // Compute masked correlation: mask * (X.T @ X) / batch_size
 // X is (batch_size, n_features), result is sparse where mask is non-zero
 // mask is in COO format (mask_rows, mask_cols) for efficient element-wise access
-// Optimized with SIMD operations and threadgroup memory for parallel reduction
+uint tid = thread_position_in_grid.x;
+if (tid >= mask_nnz) return;
 
-constexpr int N_READS = 4;
-constexpr int SIMD_SIZE = 32;
+int row_i = mask_rows[tid];
+int col_j = mask_cols[tid];
 
-uint gid = threadgroup_position_in_grid.x;
-uint tid = thread_position_in_threadgroup.x;
-uint simd_lane_id = thread_index_in_simdgroup;
-uint simd_group_id = simdgroup_index_in_threadgroup;
+bfloat16_t sum = bfloat16_t(0);
 
-if (gid >= mask_nnz) return;
-
-// Allocate threadgroup memory for SIMD group partial sums
-// Size 32 supports up to 1024 threads (32 SIMD groups)
-threadgroup float local_sum[32];
-
-int row_i = mask_rows[gid];
-int col_j = mask_cols[gid];
-
-// Each thread processes N_READS elements at a time for better memory bandwidth
-// Stride by 256 (threadgroup size as configured in kernel launch)
-float partial_sum = 0.0f;
-for (int b = tid * N_READS; b < batch_size; b += 256 * N_READS) {
-    for (int i = 0; i < N_READS; i++) {
-        int batch_idx = b + i;
-        if (batch_idx < batch_size) {
-            bfloat16_t x_i = X[batch_idx * n_features + row_i];
-            bfloat16_t x_j = X[batch_idx * n_features + col_j];
-            partial_sum += float(x_i) * float(x_j);
-        }
-    }
+// Compute dot product of column row_i and column col_j
+for (int b = 0; b < batch_size; b++) {
+    sum += X[b * n_features + row_i] * X[b * n_features + col_j];
 }
 
-// First reduction: within each SIMD group (32 threads) using hardware shuffle
-partial_sum = simd_sum(partial_sum);
-
-// Store each SIMD group's result in threadgroup memory
-if (simd_lane_id == 0) {
-    local_sum[simd_group_id] = partial_sum;
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-// Second reduction: across SIMD groups (first SIMD group does the work)
-// With 256 threads, we have 8 SIMD groups to reduce
-if (simd_group_id == 0) {
-    float total = (simd_lane_id < 8) ? local_sum[simd_lane_id] : 0.0f;
-    total = simd_sum(total);
-    if (simd_lane_id == 0) {
-        out_data[gid] = bfloat16_t(total / float(batch_size));
-    }
-}
+out_data[tid] = sum / bfloat16_t(batch_size);
 """
 
 sparse_matrix_matmul_kernel = mx.fast.metal_kernel(
@@ -113,42 +129,6 @@ masked_correlation_kernel = mx.fast.metal_kernel(
 )
 
 
-def _sparse_vector_matmul(
-    row_ptr: mx.array,
-    mat_cols: mx.array,
-    mat_data: mx.array,
-    vec: mx.array,
-    n_rows: int,
-) -> mx.array:
-    """
-    Perform sparse matrix-vector multiplication: y = A @ x
-
-    Args:
-        row_ptr: CSR row pointer array (size n_rows + 1)
-        mat_cols: Column indices of the sparse matrix
-        mat_data: Non-zero values of the sparse matrix
-        vec: Dense vector to multiply with
-        n_rows: Number of rows in the output
-
-    Returns:
-        Dense result vector
-    """
-    n_rows_array = mx.array(n_rows, dtype=mx.int32)
-
-    # Use the dtype of the input data (prefer vec dtype if both are present)
-    output_dtype = vec.dtype if vec.dtype == mx.bfloat16 else mat_data.dtype
-
-    outputs = sparse_vector_matmul_kernel(  # pyright: ignore
-        inputs=[row_ptr, mat_cols, mat_data, vec, n_rows_array],
-        grid=(n_rows, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[(n_rows,)],
-        output_dtypes=[output_dtype],
-        stream=mx.gpu,
-    )
-    return outputs[0]
-
-
 def _sparse_matrix_matmul(
     row_ptr: mx.array,
     mat_cols: mx.array,
@@ -176,10 +156,13 @@ def _sparse_matrix_matmul(
     # Use the dtype of the input data (prefer dense_mat dtype if both are present)
     output_dtype = dense_mat.dtype if dense_mat.dtype == mx.bfloat16 else mat_data.dtype
 
+    # Adjust grid for vectorized reads (4 elements per thread)
+    grid_y = (n_cols_out + 3) // 4
+
     outputs = sparse_matrix_matmul_kernel(  # pyright: ignore
         inputs=[row_ptr, mat_cols, mat_data, dense_mat, n_rows_array, n_cols_out_array],
-        grid=(n_rows, n_cols_out, 1),
-        threadgroup=(16, 16, 1),
+        grid=(n_rows, grid_y, 1),
+        threadgroup=(1, 32, 1),
         output_shapes=[(n_rows * n_cols_out,)],
         output_dtypes=[output_dtype],
         stream=mx.gpu,
@@ -258,16 +241,9 @@ class Matrix:
     def __matmul__(self, other):
         """Matrix multiplication operator (@)."""
         if isinstance(other, mx.array):
-            if len(other.shape) == 1:
-                # Sparse matrix @ dense vector
-                return _sparse_vector_matmul(
-                    self.row_ptr, self.cols, self.data, other, self.shape[0]
-                )
-            else:
-                # Sparse matrix @ dense matrix - use custom kernel
-                return _sparse_matrix_matmul(
-                    self.row_ptr, self.cols, self.data, other, self.shape[0]
-                )
+            return _sparse_matrix_matmul(
+                self.row_ptr, self.cols, self.data, other, self.shape[0]
+            )
         else:
             return NotImplemented
 
